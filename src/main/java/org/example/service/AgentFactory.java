@@ -28,6 +28,7 @@ public final class AgentFactory {
                 .baseUrl("http://langchain4j.dev/demo/openai/v1")
                 .apiKey("demo")
                 .modelName(MODEL_NAME)
+                .maxCompletionTokens(50)
                 .listeners(List.of(new LangfuseOtelListener(MODEL_NAME, LangfuseConfig.traceName())))
                 .build();
 

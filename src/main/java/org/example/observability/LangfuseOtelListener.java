@@ -6,43 +6,26 @@ import dev.langchain4j.model.chat.listener.ChatModelListener;
 import dev.langchain4j.model.chat.listener.ChatModelRequestContext;
 import dev.langchain4j.model.chat.listener.ChatModelResponseContext;
 import io.opentelemetry.api.GlobalOpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
-import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.Tracer;
-import io.opentelemetry.context.Scope;
 
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * OpenTelemetry listener for chat models.
- */
 public class LangfuseOtelListener implements ChatModelListener {
 
-    private static final Object SPAN_KEY = "langfuse_span";
-    private static final Object SCOPE_KEY = "langfuse_scope";
+    private static final String SPAN_KEY = "langfuse_span";
+
+    // Guarantees span retrieval across async streaming threads
+    private final Map<Object, Span> activeSpans = new ConcurrentHashMap<>();
 
     private final Tracer tracer;
     private final String modelName;
     private final String traceName;
 
-    /**
-     * Constructs a listener with the given model name.
-     *
-     * @param modelName the model name
-     */
-    public LangfuseOtelListener(String modelName) {
-        this(modelName, null);
-    }
-
-    /**
-     * Constructs a listener with the given model name and trace name.
-     *
-     * @param modelName the model name
-     * @param traceName the trace name
-     */
     public LangfuseOtelListener(String modelName, String traceName) {
         this.tracer = GlobalOpenTelemetry.getTracer("langchain4j", "1.0.0");
         this.modelName = modelName;
@@ -55,78 +38,106 @@ public class LangfuseOtelListener implements ChatModelListener {
                 .setSpanKind(SpanKind.CLIENT)
                 .startSpan();
 
-        span.setAttribute("gen_ai.system", "openai");
-        span.setAttribute("gen_ai.operation.name", "chat");
-        span.setAttribute("gen_ai.request.model", modelName);
-
-        if (traceName != null && !traceName.isBlank()) {
-            span.setAttribute("langfuse.trace.name", traceName);
-        }
-
-        List<ChatMessage> messages = ctx.chatRequest().messages();
-        if (messages != null && !messages.isEmpty()) {
-            span.addEvent("gen_ai.content.prompt",
-                    Attributes.of(AttributeKey.stringKey("gen_ai.prompt"), messagesToJson(messages)));
-        }
-
+        // Store in context map and fallback map
         ctx.attributes().put(SPAN_KEY, span);
-        ctx.attributes().put(SCOPE_KEY, span.makeCurrent());
+        if (ctx.chatRequest() != null) {
+            activeSpans.put(ctx.chatRequest(), span);
+        }
+
+        try {
+            span.setAttribute("langfuse.observation.type", "generation");
+            span.setAttribute("gen_ai.system", "openai");
+            span.setAttribute("gen_ai.operation.name", "chat");
+            span.setAttribute("gen_ai.request.model", modelName);
+
+            if (traceName != null && !traceName.isBlank()) {
+                span.setAttribute("langfuse.trace.name", traceName);
+            }
+            span.setAttribute("langfuse.trace.environment", "production");
+            span.setAttribute("langfuse.trace.tags", "banking,customer-support");
+
+            span.setAttribute("langfuse.observation.metadata.service_name", "banking-agent");
+            span.setAttribute("langfuse.observation.metadata.intent", "check_transaction_status");
+
+            // Set Input Prompt
+            List<ChatMessage> messages = ctx.chatRequest() != null ? ctx.chatRequest().messages() : null;
+            if (messages != null && !messages.isEmpty()) {
+                String promptJson = safeMessagesToJson(messages);
+                span.setAttribute("gen_ai.prompt", promptJson);
+                span.setAttribute("langfuse.observation.input", promptJson);
+            }
+        } catch (Exception e) {
+            // Ignore
+        }
     }
 
     @Override
     public void onResponse(ChatModelResponseContext ctx) {
+        // Retrieve span from context or fallback map
         Span span = (Span) ctx.attributes().get(SPAN_KEY);
-        Scope scope = (Scope) ctx.attributes().get(SCOPE_KEY);
+        if (span == null && ctx.chatRequest() != null) {
+            span = activeSpans.remove(ctx.chatRequest());
+        } else if (ctx.chatRequest() != null) {
+            activeSpans.remove(ctx.chatRequest());
+        }
+
         if (span == null) {
             return;
         }
 
-        var usage = ctx.chatResponse().tokenUsage();
-        if (usage != null) {
-            span.setAttribute("gen_ai.usage.input_tokens", usage.inputTokenCount());
-            span.setAttribute("gen_ai.usage.output_tokens", usage.outputTokenCount());
-        }
+        try {
+            var response = ctx.chatResponse();
+            if (response != null) {
+                var aiMessage = response.aiMessage();
+                if (aiMessage != null && aiMessage.text() != null) {
+                    span.setAttribute("gen_ai.completion", aiMessage.text());
+                    span.setAttribute("langfuse.observation.output", aiMessage.text());
+                }
+            }
 
-        var aiMessage = ctx.chatResponse().aiMessage();
-        if (aiMessage != null && aiMessage.text() != null) {
-            span.addEvent("gen_ai.content.completion",
-                    Attributes.of(AttributeKey.stringKey("gen_ai.completion"), aiMessage.text()));
+            span.setStatus(StatusCode.OK);
+        } catch (Exception e) {
+            span.recordException(e);
+            span.setStatus(StatusCode.ERROR, e.getMessage());
+        } finally {
+            span.end();
         }
-
-        span.setStatus(StatusCode.OK);
-        if (scope != null) {
-            scope.close();
-        }
-        span.end();
     }
 
     @Override
     public void onError(ChatModelErrorContext ctx) {
         Span span = (Span) ctx.attributes().get(SPAN_KEY);
-        Scope scope = (Scope) ctx.attributes().get(SCOPE_KEY);
-        if (span == null) {
-            return;
+        if (span == null && ctx.chatRequest() != null) {
+            span = activeSpans.remove(ctx.chatRequest());
+        } else if (ctx.chatRequest() != null) {
+            activeSpans.remove(ctx.chatRequest());
         }
 
-        span.setStatus(StatusCode.ERROR, ctx.error().getMessage());
-        span.recordException(ctx.error());
-        if (scope != null) {
-            scope.close();
+        if (span == null) return;
+
+        try {
+            if (ctx.error() != null) {
+                span.recordException(ctx.error());
+                span.setStatus(StatusCode.ERROR, ctx.error().getMessage());
+            }
+        } finally {
+            span.end();
         }
-        span.end();
     }
 
-    private String messagesToJson(List<ChatMessage> messages) {
-        var sb = new StringBuilder("[");
-        for (int i = 0; i < messages.size(); i++) {
-            if (i > 0) {
-                sb.append(",");
+    private String safeMessagesToJson(List<ChatMessage> messages) {
+        try {
+            var sb = new StringBuilder("[");
+            for (int i = 0; i < messages.size(); i++) {
+                if (i > 0) sb.append(",");
+                ChatMessage msg = messages.get(i);
+                sb.append("{\"role\":\"").append(role(msg)).append("\",")
+                        .append("\"content\":\"").append(escapeJson(safeContent(msg))).append("\"}");
             }
-            ChatMessage msg = messages.get(i);
-            sb.append("{\"role\":\"").append(role(msg)).append("\",")
-              .append("\"content\":\"").append(escapeJson(content(msg))).append("\"}");
+            return sb.append("]").toString();
+        } catch (Exception e) {
+            return "[Error: " + e.getMessage() + "]";
         }
-        return sb.append("]").toString();
     }
 
     private String role(ChatMessage msg) {
@@ -139,30 +150,42 @@ public class LangfuseOtelListener implements ChatModelListener {
         };
     }
 
-    private String content(ChatMessage msg) {
-        return switch (msg.type()) {
-            case SYSTEM -> ((SystemMessage) msg).text();
-            case USER -> {
-                UserMessage um = (UserMessage) msg;
-                yield um.hasSingleText() ? um.singleText() : um.toString();
-            }
-            case AI -> {
-                AiMessage am = (AiMessage) msg;
-                yield am.text() != null ? am.text() : "[tool calls]";
-            }
-            case TOOL_EXECUTION_RESULT -> ((ToolExecutionResultMessage) msg).text();
-            case CUSTOM -> msg.toString();
-        };
+    private String safeContent(ChatMessage msg) {
+        if (msg == null) return "";
+        try {
+            return switch (msg.type()) {
+                case SYSTEM -> ((SystemMessage) msg).text();
+                case USER -> {
+                    UserMessage um = (UserMessage) msg;
+                    yield um.hasSingleText() ? um.singleText() : String.valueOf(um.contents());
+                }
+                case AI -> {
+                    AiMessage am = (AiMessage) msg;
+                    if (am.text() != null && !am.text().isBlank()) {
+                        yield am.text();
+                    } else if (am.hasToolExecutionRequests()) {
+                        yield "[Tool Calls: " + am.toolExecutionRequests() + "]";
+                    } else {
+                        yield am.toString();
+                    }
+                }
+                case TOOL_EXECUTION_RESULT -> {
+                    ToolExecutionResultMessage tm = (ToolExecutionResultMessage) msg;
+                    yield tm.text() != null ? tm.text() : "";
+                }
+                case CUSTOM -> msg.toString();
+            };
+        } catch (Exception e) {
+            return msg.toString();
+        }
     }
 
     private String escapeJson(String text) {
-        if (text == null) {
-            return "";
-        }
+        if (text == null) return "";
         return text.replace("\\", "\\\\")
-                   .replace("\"", "\\\"")
-                   .replace("\n", "\\n")
-                   .replace("\r", "\\r")
-                   .replace("\t", "\\t");
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
     }
 }
