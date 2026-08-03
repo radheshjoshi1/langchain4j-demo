@@ -2,6 +2,8 @@ package org.example;
 
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import org.example.config.OpenTelemetryConfig;
+import org.example.eval.DatasetItemRunner;
+import org.example.models.DatasetResponse;
 import org.example.service.AgentFactory;
 import org.example.service.StreamingSupportAgent;
 
@@ -35,7 +37,12 @@ public class Main {
             System.out.println("[System]: Shutdown complete.");
         }));
 
-        runConsoleChat(streamingSupportAgent);
+        //Dataset Item Runner
+        DatasetItemRunner itemRunner = new DatasetItemRunner(streamingSupportAgent);
+        DatasetResponse response = itemRunner.fetchDatasetItems("banking-assistant");
+        itemRunner.runDataset(response);
+        //Console Chat
+//        runConsoleChat(streamingSupportAgent);
     }
 
     private static void runConsoleChat(StreamingSupportAgent agent) {
