@@ -37,10 +37,18 @@ public class Main {
             System.out.println("[System]: Shutdown complete.");
         }));
 
-        //Dataset Item Runner
-        DatasetItemRunner itemRunner = new DatasetItemRunner(streamingSupportAgent);
-        DatasetResponse response = itemRunner.fetchDatasetItems("banking-assistant");
-        itemRunner.runDataset(response);
+        DatasetItemRunner runner = new DatasetItemRunner(streamingSupportAgent);
+
+        // 1. Fetch dataset items from Langfuse
+        DatasetResponse dataset = runner.fetchDatasetItems("banking-assistant");
+
+        // 2. Generate a unique run name (e.g., "v1-prompt-test-2026-08-04")
+        String runName = "run-" + System.currentTimeMillis();
+
+        // 3. Execute all items sequentially
+        runner.runDataset(dataset, runName);
+
+
         //Console Chat
 //        runConsoleChat(streamingSupportAgent);
     }
