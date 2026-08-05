@@ -115,3 +115,103 @@ Added a complete evaluation (eval) layer under `src/main/java/org/example/eval/`
                 ├── LLMEvaluator.evaluate()
                 └── DatasetUploader.uploadScore()
 ```
+
+---
+
+## Date: 2026-08-05
+
+The eval layer above has since been reworked: `DatasetUploader`, `CodeEvaluator`,
+`LLMEvaluator`, `EvalRunner`, and `LiveEvalService` are gone, replaced by
+`DatasetItemRunner` (dataset runs) and `DeterministicEvaluator`. This entry covers today's
+changes on top of that current shape.
+
+### `DatasetItemRunner.java` (modified): own the trace per dataset item, add LLM-as-judge scoring
+
+- Each dataset item run now starts its own root span (`dataset-item-run`) and makes it
+  current for the whole agent call, instead of using `item.getSourceTraceId()`. This means
+  `LangfuseOtelListener`'s per-LLM-call spans are parented under it and share its trace ID,
+  so the score/run-item posted to Langfuse points at the trace this run actually produced,
+  not whatever historical trace the dataset item was originally captured from.
+- Trace-level attributes (`langfuse.trace.name/environment/tags`) are now set on this root
+  span, since Langfuse reads trace-level metadata from the root observation only.
+- Trace/run-level input and output (`langfuse.observation.input` / `.output`) are now set on
+  the root span too — using the user prompt and the full streamed agent response — so the
+  Langfuse dataset run list and trace view show non-empty input/output. Previously only the
+  nested "chat ..." generation span (from `LangfuseOtelListener`) carried this data, which is
+  a child observation, not what Langfuse reads for the trace/run itself.
+- Added `LlmJudgeEvaluator` scoring alongside the existing `DeterministicEvaluator`: after
+  each item's response completes, the judge scores it and the result is posted to Langfuse
+  as an additional score (`llm_judge`) on the same trace.
+
+### New: `org.example.eval.judge` package (LLM-as-judge)
+
+- **`LlmJudgeEvaluator`** — builds an `OpenAiChatModel` (`gpt-4o-mini` via the LangChain4j
+  demo endpoint) once and reuses it across items. Scores `actualOutput` against
+  `expectedOutput` (or, if none was provided, against the question alone) on a 0.0–1.0 scale,
+  clamped and NaN-safe. Judge failures are caught and posted as a `0.0` score with the
+  exception message as the rationale, rather than failing the run.
+- **`LlmJudgeAssistant`** — LangChain4j `AiServices` interface defining the judge's system
+  prompt (strict on factual correctness, ignored questions, contradictions) and structured
+  output contract.
+- **`JudgeResult`** — structured output DTO (`score`, `rationale`) that the assistant
+  populates directly from the model response.
+
+### Known limitation (not fixed by code)
+
+Traces can take up to ~10 minutes to appear in the Langfuse dashboard. This is Langfuse
+Cloud's ingestion queue latency on the free/hobby tier, not something controlled by the
+exporter config (`OpenTelemetryConfig`'s `BatchSpanProcessor` already flushes every 5s).
+Reducing it requires either upgrading to a paid Langfuse Cloud plan or self-hosting Langfuse.
+
+### `HttpUtil.java` (modified): surface non-2xx Langfuse responses instead of swallowing them
+
+- `sendPostRequest` previously returned `response.body()` unconditionally and only threw on
+  `IOException`/`InterruptedException` (network-level failure). A Langfuse API rejection
+  (e.g. a 4xx on `/api/public/scores`) was never surfaced — the call site logged success
+  regardless. Root cause of a real incident: trace `f86441b54ef2b0f9399b65cf0e33fb2b` showed
+  only the `execution_success` score in Langfuse even though the console reported all four
+  scores (`execution_success`, `latency_within_budget`, `intent_match`, `llm_judge`) posted
+  successfully.
+- Now throws a `RuntimeException` on any status code `>= 400`, including the status and
+  response body in the message, so callers' existing catch blocks actually fire with the real
+  Langfuse error instead of silently losing it.
+
+### `DatasetItemRunner.java` (modified): log score-post failures with full RCA context, push a failure marker score
+
+- `postScoreToLangfuse`'s catch block now logs the score name, id, traceId, value, and
+  dataType alongside the underlying error (which, after the `HttpUtil` fix, includes the
+  Langfuse HTTP status/body) — enough in a single log line to root-cause a failed post without
+  reproducing it.
+- Added `postScoreFailureMarker`: when a score fails to post, it best-effort posts a companion
+  `<scoreName>_post_failed` BOOLEAN score (deterministic id, own try/catch, no retries) to the
+  same trace, so the failure is visible directly in Langfuse rather than only in local run
+  output that's gone once the console is closed.
+
+### Root cause found via the `HttpUtil` fix: Langfuse Cloud rate limit, not a dataType mismatch
+
+Running the dataset with the fixes above showed the real error for the first time: Langfuse
+Cloud enforces **30 requests/60s** on `/api/public/scores` for this key, and a 24-item dataset
+run (dataset-run-item + up to 4 scores per item) blows through that quickly, producing
+sustained `429 Rate limit exceeded` responses — not the score-config/dataType mismatch
+originally suspected from trace `f86441b54ef2b0f9399b65cf0e33fb2b`.
+
+That run also showed the failure-marker mechanism actively working against itself: each failed
+score triggered a marker POST to the *same* rate-limited endpoint, which also 429'd, doubling
+request volume while already over quota. Fixed with two follow-up changes:
+
+### `HttpStatusException.java` (new) and `HttpUtil.java` (modified): typed status errors + rate limiting
+
+- Added `HttpStatusException` (carries the HTTP status code) so callers can branch on status
+  (e.g. 429) instead of string-matching the exception message.
+- `sendPostRequest` and `sendGetRequest` now throw `HttpStatusException` on non-2xx (previously
+  only `sendPostRequest` checked status, and with a plain `RuntimeException`).
+- Added `RateLimiter` (new, sliding-window, `Deque<Instant>`-based) and wired a shared
+  `25 requests/60s` instance into both `HttpUtil` methods — under Langfuse's observed 30/60s
+  limit with margin — so a dataset run paces itself instead of bursting into 429s.
+
+### `DatasetItemRunner.java` (modified): don't post a failure marker for a 429
+
+- `postScoreToLangfuse`'s catch block now checks for `HttpStatusException` with status 429 and
+  skips `postScoreFailureMarker` in that case, logging why instead. Posting a marker for a
+  rate-limit failure just spends more of the same exhausted quota and is guaranteed to fail too
+  — the `HttpUtil` rate limiter is what actually prevents hitting 429 in the first place.
