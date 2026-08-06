@@ -25,11 +25,17 @@ public class LangfuseOtelListener implements ChatModelListener {
     private final Tracer tracer;
     private final String modelName;
     private final String traceName;
+    private final String sessionId;
 
     public LangfuseOtelListener(String modelName, String traceName) {
+        this(modelName, traceName, null);
+    }
+
+    public LangfuseOtelListener(String modelName, String traceName, String sessionId) {
         this.tracer = GlobalOpenTelemetry.getTracer("langchain4j", "1.0.0");
         this.modelName = modelName;
         this.traceName = traceName;
+        this.sessionId = sessionId;
     }
 
     @Override
@@ -52,6 +58,9 @@ public class LangfuseOtelListener implements ChatModelListener {
 
             if (traceName != null && !traceName.isBlank()) {
                 span.setAttribute("langfuse.trace.name", traceName);
+            }
+            if (sessionId != null && !sessionId.isBlank()) {
+                span.setAttribute("langfuse.session.id", sessionId);
             }
             span.setAttribute("langfuse.trace.environment", "production");
             span.setAttribute("langfuse.trace.tags", "banking,customer-support");

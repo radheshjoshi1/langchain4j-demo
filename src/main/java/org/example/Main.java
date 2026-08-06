@@ -9,6 +9,7 @@ import org.example.service.StreamingSupportAgent;
 
 import java.util.Scanner;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -29,7 +30,20 @@ public class Main {
 
         System.out.println("=== Agent Online (Langfuse tracing enabled) ===");
 
-        StreamingSupportAgent streamingSupportAgent = AgentFactory.createAgent();
+        boolean consoleMode = args.length > 0 && "console".equalsIgnoreCase(args[0]);
+
+        // Only console mode needs this passed into the listener: a console turn has no root
+        // span of its own to carry a session id, so LangfuseOtelListener has to stamp one on
+        // the "chat ..." generation span directly. The dataset run gets its session grouping
+        // from DatasetItemRunner's own per-run session id on each item's root span instead -
+        // passing this one there too would stamp two conflicting session ids onto the same
+        // trace (child generation spans export before the root span, which only ends after
+        // scoring completes, so the two values raced and Langfuse split one run's traces
+        // across two sessions instead of grouping them under one).
+        String sessionId = "session-" + UUID.randomUUID();
+        StreamingSupportAgent streamingSupportAgent = consoleMode
+                ? AgentFactory.createAgent(sessionId)
+                : AgentFactory.createAgent();
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             openTelemetry.getSdkTracerProvider().forceFlush().join(10, TimeUnit.SECONDS);
@@ -37,20 +51,14 @@ public class Main {
             System.out.println("[System]: Shutdown complete.");
         }));
 
-        DatasetItemRunner runner = new DatasetItemRunner(streamingSupportAgent);
-
-        // 1. Fetch dataset items from Langfuse
-        DatasetResponse dataset = runner.fetchDatasetItems("banking-assistant");
-
-        // 2. Generate a unique run name (e.g., "v1-prompt-test-2026-08-04")
-        String runName = "run-" + System.currentTimeMillis();
-
-        // 3. Execute all items sequentially
-        runner.runDataset(dataset, runName);
-
-
-        //Console Chat
-//        runConsoleChat(streamingSupportAgent);
+        if (consoleMode) {
+            runConsoleChat(streamingSupportAgent);
+        } else {
+            DatasetItemRunner runner = new DatasetItemRunner(streamingSupportAgent);
+            DatasetResponse dataset = runner.fetchDatasetItems("banking-assistant");
+            String runName = "run-" + System.currentTimeMillis();
+            runner.runDataset(dataset, runName);
+        }
     }
 
     private static void runConsoleChat(StreamingSupportAgent agent) {

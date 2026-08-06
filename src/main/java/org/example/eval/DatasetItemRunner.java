@@ -44,7 +44,8 @@ public class DatasetItemRunner {
     }
 
     /**
-     * Runs evaluation over all items in a dataset.
+     * Runs evaluation over all items in a dataset, grouping every item's trace under a single
+     * Langfuse session so the whole run can be viewed as one session in the dashboard.
      */
     public void runDataset(DatasetResponse datasetResponse, String runName) {
         List<DatasetItem> items = datasetResponse.getData();
@@ -55,16 +56,22 @@ public class DatasetItemRunner {
 
         System.out.printf("[Eval]: Starting dataset run '%s' with %d items...%n", runName, items.size());
 
+        // One session ID for the whole run: every item's trace links to it so Langfuse groups
+        // them as a single session instead of leaving each item's trace unrelated to the others.
+        // Generated independently of runName since Dataset Run and Session are unrelated
+        // Langfuse concepts that happen to both need an identifier here.
+        String sessionId = "session-" + UUID.randomUUID();
+
         int count = 1;
         for (DatasetItem item : items) {
             System.out.printf("%n--- Running Item %d/%d (ID: %s) ---%n", count++, items.size(), item.getId());
-            run(item, runName);
+            run(item, runName, sessionId);
         }
 
         System.out.println("\n[Eval]: Dataset run completed.");
     }
 
-    public void run(DatasetItem item, String runName) {
+    public void run(DatasetItem item, String runName, String sessionId) {
         String itemId = item.getId();
         Instant start = Instant.now();
 
@@ -78,11 +85,16 @@ public class DatasetItemRunner {
         // LangfuseOtelListener's child span - is now the root, the trace name/environment/tags
         // have to be set here or they silently fall back to the raw span name "dataset-item-run".
         itemSpan.setAttribute("langfuse.trace.name", LangfuseConfig.traceName());
+        if (sessionId != null && !sessionId.isBlank()) {
+            itemSpan.setAttribute("langfuse.session.id", sessionId);
+        }
         itemSpan.setAttribute("langfuse.trace.environment", "production");
         itemSpan.setAttribute("langfuse.trace.tags", "banking,customer-support");
         String traceId = itemSpan.getSpanContext().getTraceId();
 
-        try (Scope scope = itemSpan.makeCurrent()) {
+        // Scope is unused by name - its only job is to be closed by try-with-resources, which
+        // pops itemSpan off the OTel context so LangfuseOtelListener's child spans parent under it.
+        try (Scope ignored = itemSpan.makeCurrent()) {
             String userPrompt = extractLatestUserPrompt(item.getInput());
             if (userPrompt == null) {
                 System.out.println("[Eval]: Skipped item (No user prompt found).");

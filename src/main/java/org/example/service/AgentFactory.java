@@ -24,12 +24,23 @@ public final class AgentFactory {
      * @return the configured StreamingSupportAgent
      */
     public static StreamingSupportAgent createAgent() {
+        return createAgent(null);
+    }
+
+    /**
+     * Builds and configures the StreamingSupportAgent, grouping every trace it produces
+     * under the given Langfuse session ID.
+     *
+     * @param sessionId Langfuse session ID to tag traces with, or null to leave traces ungrouped
+     * @return the configured StreamingSupportAgent
+     */
+    public static StreamingSupportAgent createAgent(String sessionId) {
         OpenAiStreamingChatModel streamingChatModel = OpenAiStreamingChatModel.builder()
                 .baseUrl("http://langchain4j.dev/demo/openai/v1")
                 .apiKey("demo")
                 .modelName(MODEL_NAME)
                 .maxCompletionTokens(50)
-                .listeners(List.of(new LangfuseOtelListener(MODEL_NAME, LangfuseConfig.traceName())))
+                .listeners(List.of(new LangfuseOtelListener(MODEL_NAME, LangfuseConfig.traceName(), sessionId)))
                 .build();
 
         return AiServices.builder(StreamingSupportAgent.class)

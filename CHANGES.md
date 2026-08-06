@@ -215,3 +215,51 @@ request volume while already over quota. Fixed with two follow-up changes:
   skips `postScoreFailureMarker` in that case, logging why instead. Posting a marker for a
   rate-limit failure just spends more of the same exhausted quota and is guaranteed to fail too
   — the `HttpUtil` rate limiter is what actually prevents hitting 429 in the first place.
+
+---
+
+## Date: 2026-08-06
+
+### Bug: a single dataset run showed up as two Langfuse sessions instead of one
+
+A 24-item dataset run appeared in the Langfuse dashboard split across two sessions (22 traces
++ 5 traces), rather than one session of 24. Root cause: two different, unrelated Langfuse
+session ids were being stamped onto the same trace.
+
+- `Main.java` generated a process-wide session id and passed it into
+  `AgentFactory.createAgent(sessionId)` → `LangfuseOtelListener`, which stamped
+  `langfuse.session.id` on every **child** "chat ..." generation span it creates per LLM call
+  (`LangfuseOtelListener.onRequest`).
+- `DatasetItemRunner.runDataset()` separately generated its own session id per run and stamped
+  it on the **root** `dataset-item-run` span for each item (`DatasetItemRunner.run`).
+
+Both spans belong to the same OTel trace, so every trace carried two conflicting
+`langfuse.session.id` values. Child generation spans end (and export) as soon as their LLM call
+completes, while the root span only ends after scoring/posting finishes — so the two
+conflicting values raced to be ingested, and Langfuse inconsistently grouped individual traces
+under whichever session id it processed for that trace, some items' extra tool-call round trip
+(a second child generation span) increasing the odds of a trace being counted under both.
+
+### `Main.java` (modified): stop passing a conflicting session id into the agent used for dataset runs
+
+- `AgentFactory.createAgent(sessionId)` → `AgentFactory.createAgent()`. The session id
+  generated in `main` is no longer passed to the agent/listener, since the active path
+  (dataset eval run) already gets its session grouping from `DatasetItemRunner`'s own
+  per-run session id on each item's root span. The local `sessionId` variable and comment are
+  kept, since `runConsoleChat` (currently commented out) has no other span setting a session
+  and would need it passed back in if re-enabled.
+
+### `Main.java` (modified): pick dataset run vs. console chat via a CLI arg instead of commenting code out
+
+- Switching between the dataset eval run and the console chat previously meant editing
+  `main()` — commenting one call back in and the other out — and, per the change above, that
+  editing also had to remember to move the `sessionId` argument along with it, since only
+  console chat needs it (it has no per-turn root span of its own to carry a session id, unlike
+  each dataset item's `dataset-item-run` root span).
+- Added `boolean consoleMode = args.length > 0 && "console".equalsIgnoreCase(args[0])`. Both
+  branches now live in `main()` behind that flag, and the agent is built with
+  `AgentFactory.createAgent(sessionId)` when `consoleMode` is true or
+  `AgentFactory.createAgent()` (no session id) otherwise — so each mode always gets the right
+  session-tagging behavior without hand-editing.
+- Usage: `mvn exec:java -Dexec.args="console"` (or `console` as the first program arg) runs the
+  console chat; no arg (the default) runs the dataset run, as before.
