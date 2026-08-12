@@ -3,10 +3,12 @@ package org.example;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import org.example.config.OpenTelemetryConfig;
 import org.example.eval.DatasetItemRunner;
+import org.example.eval.RunResult;
 import org.example.models.DatasetResponse;
 import org.example.service.AgentFactory;
 import org.example.service.StreamingSupportAgent;
 
+import java.util.List;
 import java.util.Scanner;
 import java.util.Set;
 import java.util.UUID;
@@ -57,7 +59,9 @@ public class Main {
             DatasetItemRunner runner = new DatasetItemRunner(streamingSupportAgent);
             DatasetResponse dataset = runner.fetchDatasetItems("banking-assistant");
             String runName = "run-" + System.currentTimeMillis();
-            runner.runDataset(dataset, runName);
+            List<RunResult> results = runner.runDataset(dataset, runName);
+            long passed = results.stream().filter(r -> r.passed("execution_success")).count();
+            System.out.printf("%n[Eval Summary]: %d/%d items passed execution_success.%n", passed, results.size());
         }
     }
 
