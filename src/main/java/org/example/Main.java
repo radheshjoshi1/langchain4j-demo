@@ -3,10 +3,13 @@ package org.example;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import org.example.config.OpenTelemetryConfig;
 import org.example.eval.DatasetItemRunner;
+import org.example.exceptions.ExceptionAgentFactory;
+import org.example.exceptions.ExceptionAgentProcessor;
 import org.example.models.DatasetResponse;
 import org.example.service.AgentFactory;
 import org.example.service.StreamingSupportAgent;
 
+import java.util.List;
 import java.util.Scanner;
 import java.util.Set;
 import java.util.UUID;
@@ -26,6 +29,15 @@ public class Main {
      * @param args command-line arguments
      */
     public static void main(String[] args) {
+        // POC: embedded local-ML exception triage, run standalone via `console exceptions` -
+        // exercises the langgraph4j graph (FetchExceptionContextNode -> CallMlModelNode ->
+        // AutoResolveNode/ManualReviewNode) without going through the chat agent at all. See
+        // ExceptionAgentFactory for the embedded-ONNX-vs-placeholder model selection.
+        if (args.length > 0 && "exceptions".equalsIgnoreCase(args[0])) {
+            runExceptionDemo();
+            return;
+        }
+
         OpenTelemetrySdk openTelemetry = OpenTelemetryConfig.initOpenTelemetry();
 
         System.out.println("=== Agent Online (Langfuse tracing enabled) ===");
@@ -71,6 +83,31 @@ public class Main {
             DatasetResponse dataset = runner.fetchDatasetItems("banking-assistant");
             String runName = "run-" + System.currentTimeMillis();
             runner.runDataset(dataset, runName);
+        }
+    }
+
+    /**
+     * Runs a fixed sample of transactions through the exception graph and prints the routing
+     * decision for each. Defaults to the safe placeholder ML client ({@code EXCEPTION_ML_ENABLED}
+     * unset/false); set it to {@code true} (plus {@code EXCEPTION_ML_MODEL_PATH} etc.) to route
+     * through a real ONNX model instead.
+     */
+    private static void runExceptionDemo() {
+        System.out.println("[System]: Running embedded local-ML exception triage demo.");
+        try {
+            ExceptionAgentProcessor processor = ExceptionAgentFactory.createProcessor();
+            List<String[]> sampleTransactions = List.of(
+                    new String[]{"TXN_001", "CUS_001"},
+                    new String[]{"TXN_002", "CUS_002"},
+                    new String[]{"TXN_003", "CUS_001"},
+                    new String[]{"TXN_999", "CUS_002"});
+
+            for (String[] transaction : sampleTransactions) {
+                String resolution = processor.process(transaction[0], transaction[1]);
+                System.out.println("[Exception]: " + resolution);
+            }
+        } catch (Exception e) {
+            System.err.println("[System]: Failed to run exception triage demo: " + e.getMessage());
         }
     }
 
