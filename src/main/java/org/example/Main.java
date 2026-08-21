@@ -31,6 +31,12 @@ public class Main {
         System.out.println("=== Agent Online (Langfuse tracing enabled) ===");
 
         boolean consoleMode = args.length > 0 && "console".equalsIgnoreCase(args[0]);
+        // POC model backends selectable in console mode:
+        //   console          -> hosted OpenAI-compatible endpoint (default)
+        //   console local    -> model served by Ollama on localhost (AgentFactory.createLocalAgent())
+        //   console embedded -> model loaded and run in this JVM via Jlama, no separate process
+        //                       (AgentFactory.createEmbeddedAgent())
+        String backend = args.length > 1 ? args[1].toLowerCase() : "";
 
         // Only console mode needs this passed into the listener: a console turn has no root
         // span of its own to carry a session id, so LangfuseOtelListener has to stamp one on
@@ -41,9 +47,16 @@ public class Main {
         // scoring completes, so the two values raced and Langfuse split one run's traces
         // across two sessions instead of grouping them under one).
         String sessionId = "session-" + UUID.randomUUID();
-        StreamingSupportAgent streamingSupportAgent = consoleMode
-                ? AgentFactory.createAgent(sessionId)
-                : AgentFactory.createAgent();
+        StreamingSupportAgent streamingSupportAgent;
+        if ("local".equals(backend)) {
+            streamingSupportAgent = AgentFactory.createLocalAgent();
+        } else if ("embedded".equals(backend)) {
+            streamingSupportAgent = AgentFactory.createEmbeddedAgent();
+        } else if (consoleMode) {
+            streamingSupportAgent = AgentFactory.createAgent(sessionId);
+        } else {
+            streamingSupportAgent = AgentFactory.createAgent();
+        }
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             openTelemetry.getSdkTracerProvider().forceFlush().join(10, TimeUnit.SECONDS);

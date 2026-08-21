@@ -263,3 +263,269 @@ under whichever session id it processed for that trace, some items' extra tool-c
   session-tagging behavior without hand-editing.
 - Usage: `mvn exec:java -Dexec.args="console"` (or `console` as the first program arg) runs the
   console chat; no arg (the default) runs the dataset run, as before.
+
+---
+
+## Date: 2026-08-20
+
+### Local model POC, part 1: call a model running locally (Ollama), as a separate process
+
+Requirement: stand up an ML model running locally and call it from the agent, as a POC,
+alongside the existing hosted-endpoint agent (not replacing it).
+
+Chose Ollama since it was already installed on the host with its daemon running
+(`localhost:11434`). Pulled `llama3.2:1b` first; it consistently mis-extracted tool-call
+arguments (called `checkPaymentStatus` with a null transaction id), so switched to
+`llama3.2:3b`, which extracted arguments correctly.
+
+- **`pom.xml` (modified)**: added `dev.langchain4j:langchain4j-ollama:${langchain4j.version}`.
+- **`AgentFactory.java` (modified)**: added `createLocalAgent()` — builds an
+  `OllamaStreamingChatModel` pointed at `http://localhost:11434` with model name
+  `llama3.2:3b`, assembled with the same tools (`PaymentService`, `AccountService`) and
+  `MessageWindowChatMemory` as `createAgent()`. No `LangfuseOtelListener` attached: that
+  listener hardcodes `gen_ai.system = "openai"` on every span, so wiring a non-OpenAI model
+  into it would mislabel traces — left out of scope for a POC path.
+- **`Main.java` (modified)**: `console local` now builds the agent via `createLocalAgent()`
+  instead of the hosted endpoint.
+
+Verified end-to-end: `console local` correctly drove the full agent loop (streaming, tool
+call, tool result) against the local Ollama model — see "How to run and test" below.
+
+### Requirement change: embed the model in the same process, not call it as an endpoint
+
+Requirement changed: the model must run *inside* the agent's own JVM process, not as a
+server the agent calls over HTTP — Ollama (part 1 above) is still a separate process on
+localhost, so it doesn't satisfy this.
+
+Evaluated two in-process options and asked the user to choose:
+- **Jlama** — pure-Java LLM inference engine, official `langchain4j-jlama` integration.
+  Requires Java 20+ (uses the `jdk.incubator.vector` module for tensor math). Chosen.
+- **java-llama.cpp** (`de.kherud:llama`) — JNI bindings to llama.cpp, bundled native
+  `.so`/`.dylib` loaded in-process. Would have kept the project on Java 17, but has no
+  official langchain4j module, so it would've meant hand-writing a custom
+  `ChatModel`/`StreamingChatModel` adapter. Not chosen.
+
+- **`pom.xml` (modified)**:
+  - `maven.compiler.source`/`target` raised from `17` to `21` — required by
+    `langchain4j-jlama`. (Built with the JDK 25 already on the host, targeting release 21;
+    no separate JDK install needed since `--release`-style compilation across JDKs is
+    standard.)
+  - Added `dev.langchain4j:langchain4j-jlama:1.16.1-beta26` — the `langchain4j-jlama`
+    version aligned to core `langchain4j` 1.16.1 (the module trails core with its own
+    `-betaN` suffix; `1.16.1-beta26` is that pairing).
+  - `maven-surefire-plugin` now sets `<argLine>--add-modules jdk.incubator.vector</argLine>`,
+    so `mvn test` keeps working once Jlama-backed code is on the test classpath — Jlama's
+    tensor operations use the Vector API, an incubator module the JVM won't resolve on the
+    classpath by default without this flag.
+- **`AgentFactory.java` (modified)**: added `createEmbeddedAgent()` — builds a
+  `JlamaStreamingChatModel` with `modelName("tjake/Llama-3.2-3B-Instruct-JQ4")` (a
+  Jlama-pre-quantized version of the same Llama-3.2-3B family used for the Ollama POC, so
+  the two are a fair comparison) and `modelCachePath(~/.jlama/models)`. Same tools/memory
+  as the other two agents; no `LangfuseOtelListener`, same reasoning as `createLocalAgent()`.
+- **`Main.java` (modified)**: `console local`/`console embedded` are now selected via a
+  `backend` string read from `args[1]` (`"local"` / `"embedded"`), replacing the earlier
+  single `useLocalModel` boolean now that there are three backends instead of two.
+
+### POC findings (embedded vs. separate-process local model)
+
+- Confirmed working end-to-end: on first run, Jlama downloaded the model (1.9GB) from
+  Hugging Face into `~/.jlama/models` and ran inference in-process; on later runs it loads
+  straight from that local cache, no network call. The agent's tool-calling loop
+  (`checkPaymentStatus`) worked correctly against it.
+- **CPU inference is slow without a GPU**: a full turn (tool call + synthesized response)
+  took over a minute on a 12-core host with no GPU — expect this, don't take it as a bug.
+- **Same prompt-following limitation on both backends**: after a successful tool call, both
+  the embedded Jlama model and the separate-process Ollama model (same `Llama-3.2-3B`
+  family) tend to recite the system prompt's fixed out-of-scope refusal sentence instead of
+  relaying the tool result. Reproduced this directly against Ollama's HTTP API with no
+  langchain4j involved, confirming it's a small-model/prompt-following limitation, not a
+  bug in either integration.
+- Jlama occasionally streamed a raw JSON tool-call fragment
+  (`{"name": "checkPaymentStatus", "parameters": {...}}`) as a visible text token just
+  before firing the actual structured tool call — a rough edge worth knowing about if this
+  path gets used beyond a POC.
+
+### How to run and test
+
+All three backends share the same `StreamingSupportAgent` (tools, memory, system prompt) —
+only the model differs.
+
+**Prerequisite for every mode**: `JAVA_HOME` must point at a Java 21+ JDK now (the project
+was on 17 before this entry). On this host: `export JAVA_HOME=~/.sdkman/candidates/java/25.0.2-open`
+(or any installed 21+ JDK) and put `$JAVA_HOME/bin` on `PATH`.
+
+```bash
+export JAVA_HOME=~/.sdkman/candidates/java/25.0.2-open   # any JDK 21+
+export PATH="$JAVA_HOME/bin:$PATH"
+mvn -q compile
+```
+
+**1. Hosted endpoint (default, no local model)**
+```bash
+mvn exec:java -Dexec.args="console"
+```
+
+**2. Local model via Ollama (separate process)**
+
+One-time setup:
+```bash
+ollama serve &                # if not already running as a daemon
+ollama pull llama3.2:3b
+```
+Run:
+```bash
+mvn exec:java -Dexec.args="console local"
+```
+
+**3. Embedded model via Jlama (same process, no server)**
+
+No separate daemon to start — the model downloads into `~/.jlama/models` on first use
+(~1.9GB) and loads from that cache on every run after. Needs
+`--add-modules jdk.incubator.vector` on the JVM, which `mvn exec:java` won't forward, so run
+it directly with `java` instead:
+```bash
+mvn -q dependency:build-classpath -Dmdep.outputFile=/tmp/cp.txt
+java --add-modules jdk.incubator.vector \
+     -cp "target/classes:$(cat /tmp/cp.txt)" \
+     org.example.Main console embedded
+```
+(Equivalently, `export JDK_JAVA_OPTIONS="--add-modules jdk.incubator.vector"` once per shell,
+then any `java ... org.example.Main console embedded` picks it up automatically.)
+
+**Testing either local mode**: at the `You:` prompt, try `Check the status of transaction
+TXN_001` (or `TXN_002` / `TXN_003` — see `PaymentService.java` for the seeded data) and
+confirm the console prints `[SYSTEM NOTICE]: LLM is executing 'checkPaymentStatus' tool for
+ID: TXN_00x` with the correct id before the final answer — that line is the signal the tool
+call round-tripped correctly regardless of what the model says afterward. Type `exit` to
+quit.
+
+**Sanity-checking a backend directly (bypassing the agent)**, useful for isolating whether
+an odd response is a langchain4j-wiring issue or a raw model behavior:
+```bash
+curl -s http://localhost:11434/api/chat -d '{
+  "model": "llama3.2:3b", "stream": false,
+  "messages": [{"role":"user","content":"Say hello in 5 words."}]
+}'
+```
+
+### New: `LocalModelTool.java` — the embedded model as a tool the hosted agent can call
+
+Follow-up requirement: expose the embedded Jlama model as something the *hosted* agent can
+delegate to mid-conversation, not just something you run standalone via `console embedded`.
+
+- **`LocalModelTool.java` (new, `org.example.service`)**: a `@Tool`-annotated
+  `askLocalModel(String query)` that lazily builds a blocking `JlamaChatModel` (same
+  `EMBEDDED_MODEL_NAME` / `JLAMA_MODEL_CACHE_PATH` as `AgentFactory.createEmbeddedAgent()`,
+  now package-private so both share them instead of duplicating the constants) on first call
+  and reuses it after. Lazy on purpose: an agent that's built with this tool but never
+  invokes it shouldn't pay the model-load cost.
+- **`AgentFactory.createAgent()` (modified)**: added `new LocalModelTool()` alongside
+  `PaymentService`/`AccountService` in the hosted agent's `.tools(...)` — only the hosted
+  agent gets it; `createLocalAgent()`/`createEmbeddedAgent()` are already local-model demos
+  in their own right.
+- Verified by direct method call (bypassing the LLM's tool-choice) that the tool itself
+  works, then verified through the real agent: a prompt naming the tool explicitly
+  (`"call the askLocalModel tool..."`) tripped the existing banking-scope refusal — the
+  system prompt reads tool-naming language as out-of-scope — while a natural task-shaped
+  prompt (*"check the status of TXN_002 and have it drafted into a polite customer message
+  using your offline drafting capability"*) reliably chained both tools:
+  `checkPaymentStatus` → `askLocalModel`. Added the same `[SYSTEM NOTICE]` console print
+  `PaymentService`/`AccountService` already use, since without it there was no way to tell
+  "the hosted model drafted this itself" from "it actually delegated."
+
+### New: `LocalModelUnavailableException.java` + try/catch around the local-model tool call
+
+Requirement: the local-model tool call can fail (first-run Hugging Face download errors,
+model-load failures, Jlama inference errors) and, unhandled, an exception thrown out of a
+`@Tool` method propagates up through the whole `agent.chat(...)` call and fails the entire
+turn on `Main`'s `onError` handler — losing the response completely, not just the one tool's
+contribution. Wanted a typed exception for this failure mode and one place to resolve it,
+same pattern as `HttpStatusException` (already used to branch on Langfuse 429s in
+`DatasetItemRunner`).
+
+- **`LocalModelUnavailableException.java` (new, `org.example.util`)**: `RuntimeException`
+  subclass carrying the underlying cause, so callers can catch this specific type instead of
+  an opaque `RuntimeException` from Jlama's internals.
+- **`LocalModelTool.java` (modified)**:
+  - `localChatModel()` now wraps `JlamaChatModel.builder()...build()` failures (model
+    download/load) in `LocalModelUnavailableException`.
+  - `askLocalModel()` now wraps the whole call in try/catch: any `RuntimeException` — the
+    typed one from a load failure, or an inference-time failure from `ChatModel.chat()`
+    (Jlama maps its own IOExceptions into `dev.langchain4j.exception.*` types, e.g.
+    `AuthenticationException` for a 401 — see `JlamaExceptionMapper` — which are themselves
+    `RuntimeException`s) — is normalized to `LocalModelUnavailableException` and passed to a
+    single `resolve(...)` method: logs the real cause to stderr, then returns a plain-text
+    fallback string so the hosted agent still gets a usable tool result and the turn
+    completes, instead of the whole response erroring out. `resolve(...)` is the place to
+    add retry/circuit-breaker/alerting logic later.
+- Verified the failure path directly: pointed a standalone `JlamaChatModel.builder()` at a
+  nonexistent Hugging Face repo id and ran it through the same catch logic —
+  `dev.langchain4j.exception.AuthenticationException` (HTTP 401) came back wrapped as
+  `LocalModelUnavailableException`, with `resolve(...)`'s fallback string correctly
+  surfacing the real cause message. Re-ran the working `console` scenario above afterward to
+  confirm the try/catch didn't change the happy path.
+
+### `pom.xml` (modified): `mvn exec:java -Dexec.args="..."` was failing outright
+
+`mvn exec:java -Dexec.args="console local"` failed with `The parameters 'mainClass' ... are
+missing or invalid`. Root cause: `exec-maven-plugin` was never actually configured in this
+project — every `mvn exec:java` usage documented so far (including in the project guide)
+relied on also passing `-Dexec.mainClass=org.example.Main` by hand every time, and this
+invocation didn't.
+
+- Added an `exec-maven-plugin:3.6.3` block with `<mainClass>org.example.Main</mainClass>`,
+  so `mvn exec:java -Dexec.args="..."` now works without also passing `-Dexec.mainClass`.
+- Note: `exec:java` run standalone (not via a full `mvn compile exec:java` chain) does not
+  compile for you - it runs whatever is already sitting in `target/classes`. Run
+  `mvn compile` (or `mvn compile exec:java -Dexec.args="..."`) first if in doubt.
+- Known cosmetic quirk, not fixed: after a successful run, `exec:java` prints a
+  `NoClassDefFoundError` warning from `Main`'s shutdown hook (`OpenTelemetry...forceFlush()`
+  fails to load `CompletableResultCode`). This is `exec-maven-plugin`'s `java` goal running
+  the app through its own in-process `URLClassLoader`, which gets torn down before the JVM's
+  own shutdown-hook thread runs - a known interaction between that goal and
+  `Runtime.getRuntime().addShutdownHook(...)`, pre-existing in `Main.java` and unrelated to
+  this session's changes. It's harmless (Maven still reports `BUILD SUCCESS`, the chat
+  session itself completes normally) but means `[System]: Shutdown complete.` never prints
+  and OTel spans from that run may not get flushed. Doesn't happen when running via
+  `java -cp ...` directly (see "How to run and test" above) - use that if a clean shutdown
+  log matters.
+
+### `mvn exec:java` failing with `invalid target release: 21` in a fresh shell
+
+The `exec-maven-plugin` fix above was verified in a shell where `JAVA_HOME` had been
+exported to the JDK 25 install by hand first. In an ordinary fresh shell, `mvn` picks up
+this machine's default JDK (17.0.19, via the `sdkman` "current" symlink /
+`/usr/lib/jvm/java-17-openjdk-amd64`), and `maven-compiler-plugin` fails outright:
+`error: invalid target release: 21` - javac 17 has no concept of a "21" target.
+
+- **`~/.m2/toolchains.xml` (new, machine-local, not part of the repo)**: registers the
+  already-installed JDK 25 (`~/.sdkman/candidates/java/25.0.2-open`) as a toolchain
+  satisfying `<jdk><version>21</version></jdk>`, so plugins that consult the active
+  toolchain use it regardless of which JDK launched `mvn`. (No existing `toolchains.xml` was
+  present on this machine, so nothing was overwritten.)
+- **`pom.xml` (modified)**: added `maven-toolchains-plugin:3.1.0`, bound to its default goal
+  `toolchain` requesting `<jdk><version>21</version></jdk>` - selects that toolchain before
+  compilation runs. Also pinned `maven-compiler-plugin` to `3.13.0` (previously unpinned,
+  which was silently resolving to the 2013-era default `3.1` bundled with this Maven
+  install - toolchains have been supported since compiler-plugin 2.0.9, so this wasn't the
+  actual problem, but pinning it removes one more unpredictable variable given everything
+  else here is already version-pinned).
+- Verified in a genuinely clean shell (`env -i`, `JAVA_HOME` unset, default system JDK 17 on
+  `PATH`): `mvn -q compile` now succeeds without any manual `JAVA_HOME` export.
+
+**This does not fully fix `mvn exec:java` on its own.** The toolchain only redirects
+compilation; `exec-maven-plugin`'s `java` goal runs the compiled app *inside Maven's own
+JVM process* via reflection (not a forked subprocess), so once classes are compiled to
+Java 21 class file version 65, running them still needs Maven's own JVM - i.e. whatever JDK
+launched `mvn` - to be 21+. Confirmed this exact failure mode in the same clean shell:
+`UnsupportedClassVersionError: ... class file version 65.0 ... this version of the Java
+Runtime only recognizes class file versions up to 61.0` (Maven's own JVM was still 17).
+
+- **`.sdkmanrc` (new)**: pins `java=25.0.2-open` for this project directory. Run `sdk env`
+  once per shell before any `mvn` command (`exec:java` included) and it switches
+  `JAVA_HOME`/`PATH` for that shell to the JDK this project needs - confirmed this fixes
+  `mvn exec:java -Dexec.args="console local"` end-to-end in the same clean-shell
+  reproduction. (Equivalent to exporting `JAVA_HOME` by hand, just discoverable from the
+  project directory instead of needing to be remembered/re-documented per command. Requires
+  `sdkman_auto_env` to stay off or be handled deliberately - not changed here, since flipping
+  it on would auto-switch the JDK for every project on this machine, not just this one.)

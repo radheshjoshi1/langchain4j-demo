@@ -1,0 +1,3 @@
+# Enables `sdk env` to select the right JDK automatically for this project.
+# langchain4j-jlama requires Java 20+ (see pom.xml); the machine's default JDK is 17.
+java=25.0.2-open

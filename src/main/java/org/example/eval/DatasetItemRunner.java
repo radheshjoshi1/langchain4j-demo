@@ -12,11 +12,10 @@ import org.example.models.ChatMessage;
 import org.example.models.DatasetItem;
 import org.example.models.DatasetResponse;
 import org.example.models.EvaluationScore;
+import org.example.observability.LangfuseScoreReporter;
 import org.example.service.StreamingSupportAgent;
-import org.example.util.HttpStatusException;
 import org.example.util.HttpUtil;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
@@ -33,6 +32,7 @@ public class DatasetItemRunner {
     private final DeterministicEvaluator evaluator;
     private final LlmJudgeEvaluator llmJudge;
     private final HttpUtil httpUtil;
+    private final LangfuseScoreReporter scoreReporter;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final Tracer tracer = GlobalOpenTelemetry.getTracer("langchain4j-demo-eval", "1.0.0");
 
@@ -41,6 +41,7 @@ public class DatasetItemRunner {
         this.evaluator = new DeterministicEvaluator();
         this.llmJudge = new LlmJudgeEvaluator();
         this.httpUtil = new HttpUtil();
+        this.scoreReporter = new LangfuseScoreReporter(httpUtil);
     }
 
     /**
@@ -144,11 +145,11 @@ public class DatasetItemRunner {
 
             List<EvaluationScore> scores = evaluator.evaluate(runName, itemId, expectedOutput, actualOutput, elapsed, LATENCY_BUDGET);
             for (EvaluationScore score : scores) {
-                postScoreToLangfuse(traceId, score);
+                scoreReporter.postScore(traceId, score);
             }
 
             EvaluationScore judgeScore = llmJudge.evaluate(runName, itemId, userPrompt, expectedOutput, actualOutput);
-            postScoreToLangfuse(traceId, judgeScore);
+            scoreReporter.postScore(traceId, judgeScore);
 
         } catch (Exception e) {
             System.err.println("[Eval]: Failed turn execution for item ID: " + itemId + " - " + e.getMessage());
@@ -160,7 +161,7 @@ public class DatasetItemRunner {
                     "BOOLEAN",
                     "Exception: " + e.getMessage()
             );
-            postScoreToLangfuse(traceId, failureScore);
+            scoreReporter.postScore(traceId, failureScore);
         } finally {
             itemSpan.end();
         }
@@ -214,72 +215,4 @@ public class DatasetItemRunner {
         }
     }
 
-    private void postScoreToLangfuse(String traceId, EvaluationScore score) {
-        if (traceId == null || traceId.isEmpty()) {
-            System.out.println("[Langfuse Score Skipped]: No traceId for score " + score.name());
-            return;
-        }
-
-        try {
-            String url = LangfuseConfig.baseUrl() + "/api/public/scores";
-
-            Map<String, Object> body = new HashMap<>();
-            body.put("id", score.id());
-            body.put("traceId", traceId);
-            body.put("name", score.name());
-            body.put("value", score.value());
-            body.put("dataType", score.dataType());
-            body.put("comment", score.comment());
-
-            String jsonPayload = objectMapper.writeValueAsString(body);
-            httpUtil.sendPostRequest(url, jsonPayload);
-            System.out.println("[Langfuse Score Posted]: " + score.name() + " = " + score.value());
-        } catch (Exception e) {
-            // Everything we know about the failure - so if this can't be root-caused from
-            // Langfuse's side, this line alone has enough to go on: which score, which trace,
-            // and (since HttpUtil now surfaces HTTP status + response body on non-2xx) why.
-            System.err.println("[Langfuse API]: Failed to post score '" + score.name()
-                    + "' (id=" + score.id() + ", traceId=" + traceId + ", value=" + score.value()
-                    + ", dataType=" + score.dataType() + "): " + e.getMessage());
-
-            // A 429 means the marker POST would just spend more of the same exhausted budget
-            // and fail too - every item in the run showed exactly that during a rate-limited
-            // run. Skip it here rather than pile onto the backlog; the rate limiter in HttpUtil
-            // is what actually prevents this going forward.
-            if (e instanceof HttpStatusException httpStatusException && httpStatusException.statusCode() == 429) {
-                System.err.println("[Langfuse API]: Skipping failure marker for '" + score.name()
-                        + "' - failure was a rate limit (429), not worth spending more quota on.");
-                return;
-            }
-            postScoreFailureMarker(traceId, score, e);
-        }
-    }
-
-    /**
-     * Best-effort: when a real score fails to post, push a companion marker score so the failure
-     * itself is visible on the trace in Langfuse, not just in this run's console output.
-     */
-    private void postScoreFailureMarker(String traceId, EvaluationScore failedScore, Exception cause) {
-        try {
-            String url = LangfuseConfig.baseUrl() + "/api/public/scores";
-            String markerId = UUID.nameUUIDFromBytes(
-                    (failedScore.id() + ":post_failed").getBytes(StandardCharsets.UTF_8)).toString();
-            String comment = "Failed to post '" + failedScore.name() + "': " + cause.getMessage();
-
-            Map<String, Object> body = new HashMap<>();
-            body.put("id", markerId);
-            body.put("traceId", traceId);
-            body.put("name", failedScore.name() + "_post_failed");
-            body.put("value", 1);
-            body.put("dataType", "BOOLEAN");
-            body.put("comment", comment.length() > 500 ? comment.substring(0, 500) : comment);
-
-            String jsonPayload = objectMapper.writeValueAsString(body);
-            httpUtil.sendPostRequest(url, jsonPayload);
-            System.err.println("[Langfuse API]: Posted failure marker for score '" + failedScore.name() + "'.");
-        } catch (Exception e) {
-            System.err.println("[Langfuse API]: Also failed to post failure marker for score '"
-                    + failedScore.name() + "': " + e.getMessage());
-        }
-    }
 }
