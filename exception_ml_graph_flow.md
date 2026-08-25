@@ -41,7 +41,88 @@ Node-by-node, mirroring the source doc's roles:
 State is `ExceptionAgentState` (`org.bsc.langgraph4j.state.AgentState` subclass) with keys
 `transactionId`, `customerId`, `exceptionContext`, `mlResult`, `workflowErrors`, `resolution`.
 
-## 3. The embedded model itself
+## 3. How this fits alongside the app's other run modes
+
+`Main.main(args)` (`Main.java:31-87`) is the single dispatcher for every flow in this app. It
+branches purely on `args[0]`/`args[1]` — nothing else decides which flow runs:
+
+| Invocation | Branch in `Main.main` | What actually runs |
+|---|---|---|
+| `mvn exec:java -Dexec.args="exceptions"` | `Main.java:36-39` | **This flow.** Returns immediately, before OTel/Langfuse even initialize — `runExceptionDemo()` (`Main.java:95-112`) |
+| `mvn exec:java -Dexec.args="console"` | `consoleMode=true`, `backend=""` → `Main.java:67-68` | `AgentFactory.createAgent(sessionId)` (hosted OpenAI-compatible model) → `runConsoleChat` (interactive REPL) |
+| `mvn exec:java -Dexec.args="console local"` | `backend="local"` → `Main.java:63-64` | `AgentFactory.createLocalAgent()` (Ollama over HTTP) → `runConsoleChat` |
+| `mvn exec:java -Dexec.args="console embedded"` | `backend="embedded"` → `Main.java:65-66` | `AgentFactory.createEmbeddedAgent()` (Jlama, embedded LLM) → `runConsoleChat` |
+| `mvn exec:java` (no args) | falls through to `Main.java:81-86` | **Experiment run**: `DatasetItemRunner` pulls a Langfuse dataset and scores the agent's answers against it |
+| `mvn test` | not `Main` at all | JUnit runs `StreamingSupportAgentTest` (hits the real hosted agent, scores pass/fail cases) plus this feature's own unit tests |
+
+Every branch except `exceptions` eventually builds a `StreamingSupportAgent` (an LLM chat agent
+with tools) and either drives it interactively or batch-scores it. The `exceptions` branch is
+structurally separate — it never touches `StreamingSupportAgent`, `AgentFactory`, or Langfuse/OTel
+at all.
+
+**Why the flows don't interfere with each other:** the only files the exception flow shares with
+the others are `PaymentService`/`AccountService` — and `FetchExceptionContextNode` gets its own
+fresh instances of them (constructed in `ExceptionAgentFactory.java:20`), not the ones the chat
+agent uses. No shared mutable state, no ordering dependency between flows.
+
+## 4. Tracing one prediction end-to-end
+
+Take `processor.process("TXN_002", "CUS_002")` — exactly what `runExceptionDemo` does for that
+sample transaction:
+
+```
+Main.runExceptionDemo()                                    Main.java:106
+  → ExceptionAgentProcessor.process("TXN_002","CUS_002")   ExceptionAgentProcessor.java:19
+    → graph.invoke({transactionId:"TXN_002", customerId:"CUS_002"})   (langgraph4j CompiledGraph)
+
+    [node: fetchContext]  FetchExceptionContextNode.apply()           FetchExceptionContextNode.java:23
+      → paymentService.checkPaymentStatus("TXN_002")   → "FAILED - Invalid HMAC Signature."
+      → accountService.getAccountTier("CUS_002")       → "STANDARD"
+      → splits the payment result into status="FAILED", reasonDetail="Invalid HMAC Signature."
+      → puts ExceptionContext(TXN_002, CUS_002, FAILED, "Invalid HMAC Signature.", STANDARD)
+        into state["exceptionContext"]
+
+    [node: callMlModel]  CallMlModelNode.apply()                      CallMlModelNode.java:22
+      → THIS IS THE ML CALL SITE:
+        mlModelClient.predict(context)                                CallMlModelNode.java:26
+          → (real model) OnnxLocalMlModelClient.predict()             OnnxLocalMlModelClient.java:56
+            1. context.features()                                     ExceptionContext.java:15
+               → {statusCode: 2 (FAILED), accountTierCode: 0 (STANDARD), reasonLength: 24}
+               ^ this is "the exception query" - the numeric vector the model actually sees
+            2. toFeatureVector() orders it per EXCEPTION_ML_FEATURE_ORDER
+               → float[]{2.0, 0.0, 24.0}
+            3. ONNX Runtime session.run() - in-process, no network call
+            4. reads last value of output tensor as the bypass-eligible probability → 0.079
+            5. 0.079 < bypassThreshold(0.5) → MlPrediction(label="MANUAL_REVIEW",
+               bypassEligible=false, score=0.079, raw={...})
+      → puts that MlPrediction into state["mlResult"]
+
+    [conditional edge]  ExceptionGraphRouting.decideRoute(state)       ExceptionGraphRouting.java:16
+      → workflowErrors empty, mlResult.bypassEligible()==false → returns "MANUAL_REVIEW"
+
+    [node: manualReview]  ManualReviewNode.apply()                    ManualReviewNode.java:14
+      → builds "ROUTED TO MANUAL REVIEW TXN_002: score=0.079 below threshold"
+      → puts it into state["resolution"]
+
+  ← graph.invoke() returns final state
+← processor.process() reads state["resolution"] and returns it
+```
+
+That's the whole path — one method call (`mlModelClient.predict(context)` at
+`CallMlModelNode.java:26`) is the *only* place inference happens; everything before it is
+assembling the query (`ExceptionContext`), everything after it is routing on the answer.
+
+**If the model call fails:** `CallMlModelNode.java:24-30` wraps `predict()` in a try/catch. Any
+`RuntimeException` (bad file, shape mismatch, ONNX Runtime error) gets caught, logged, and turned
+into `state["workflowErrors"]` instead of propagating. `ExceptionGraphRouting.decideRoute` checks
+`workflowErrors` *first* (`ExceptionGraphRouting.java:18-20`) — so a failed prediction always
+routes to `manualReview`, never silently auto-resolves and never crashes the graph.
+
+**Which model backs `mlModelClient`** is decided once, at graph-build time
+(`ExceptionAgentFactory.java:19`, via `MlModelConfig.fromEnvironment()`) — not per call. See the
+config table in the next section.
+
+## 5. The embedded model itself
 
 ```
 Offline, once per model version                    Inside this JVM (langchain4j-demo)
@@ -84,7 +165,7 @@ model file on the classpath                                EXCEPTION_ML_ENABLED=
 `statusCode` (`SUCCESS=0, PENDING=1, FAILED=2, other=-1`), `accountTierCode` (`STANDARD=0,
 VIP=1, other=-1`), `reasonLength` (length of the status detail text).
 
-## 4. The fixture model used to verify this end-to-end
+## 6. The fixture model used to verify this end-to-end
 
 No trained model exists for this demo (that step is explicitly Data Science's, per the source
 doc). To prove the ONNX Runtime wiring actually works — not just the placeholder fallback — a
@@ -114,7 +195,7 @@ Verified live with `EXCEPTION_ML_ENABLED=true EXCEPTION_ML_MODEL_VERSION=fixture
 - Also verified the fail-safe path: `EXCEPTION_ML_ENABLED=true` with no model file on the
   classpath logs a load failure and falls back to the placeholder rather than crashing.
 
-## 5. Running it
+## 7. Running it
 
 ```bash
 # placeholder model (default) - always routes to manual review
@@ -127,7 +208,7 @@ EXCEPTION_ML_ENABLED=true mvn exec:java -Dexec.args="exceptions"
 (`sdk env` first if `JAVA_HOME` isn't already pointed at the JDK 21+ toolchain — see
 `langchain4j_demo_project_guide.md` / `CHANGES.md` for that quirk.)
 
-## 6. Tests
+## 8. Tests
 
 | Test | Proves |
 |---|---|
@@ -137,7 +218,7 @@ EXCEPTION_ML_ENABLED=true mvn exec:java -Dexec.args="exceptions"
 | `ExceptionGraphRoutingTest` | routing decision table: error → manual review (even with a bypass-eligible prediction), bypass-eligible → auto-resolve, missing prediction → manual review |
 | `ExceptionAgentGraphFactoryTest` | the compiled graph runs end-to-end with the placeholder client |
 
-## 7. What's intentionally out of scope
+## 9. What's intentionally out of scope
 
 Same boundary as the source design: no real trained model, no parity-check tooling, no
 artifact-store pull at startup. `EXCEPTION_ML_ENABLED` defaults to `false` so nothing changes
