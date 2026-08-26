@@ -3,9 +3,12 @@ package org.example.eval.judge;
 import dev.langchain4j.service.SystemMessage;
 import dev.langchain4j.service.UserMessage;
 import dev.langchain4j.service.V;
+import dev.langchain4j.service.guardrail.OutputGuardrails;
+import org.example.guardrail.JudgeResultConsistencyOutputGuardrail;
 
 public interface LlmJudgeAssistant {
 
+    @OutputGuardrails(JudgeResultConsistencyOutputGuardrail.class)
     @SystemMessage("""
             You are an evaluation judge for a banking support assistant.
             Score whether the actual response correctly and helpfully answers the user's

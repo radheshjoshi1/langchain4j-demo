@@ -1,5 +1,6 @@
 package org.example;
 
+import dev.langchain4j.guardrail.GuardrailException;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import org.example.config.OpenTelemetryConfig;
 import org.example.eval.DatasetItemRunner;
@@ -132,21 +133,30 @@ public class Main {
             System.out.print("Agent: ");
             CompletableFuture<Void> turnDone = new CompletableFuture<>();
 
-            agent.chat(message)
-                    .onPartialResponse(token -> {
-                        System.out.print(token);
-                        System.out.flush();
-                    })
-                    .onCompleteResponse(response -> {
-                        System.out.println();
-                        turnDone.complete(null);
-                    })
-                    .onError(error -> {
-                        System.out.println();
-                        System.err.println("[System]: Error: " + (error.getMessage() != null ? error.getMessage() : error));
-                        turnDone.complete(null);
-                    })
-                    .start();
+            try {
+                agent.chat(message)
+                        .onPartialResponse(token -> {
+                            System.out.print(token);
+                            System.out.flush();
+                        })
+                        .onCompleteResponse(response -> {
+                            System.out.println();
+                            turnDone.complete(null);
+                        })
+                        .onError(error -> {
+                            System.out.println();
+                            System.err.println("[System]: Error: " + (error.getMessage() != null ? error.getMessage() : error));
+                            turnDone.complete(null);
+                        })
+                        .start();
+            } catch (GuardrailException e) {
+                // Input guardrails (e.g. PromptInjectionInputGuardrail) run before the TokenStream is
+                // created and fail synchronously here rather than through onError() above, since the LLM
+                // is never called - handled the same way as any other agent error instead of crashing.
+                System.out.println();
+                System.err.println("[System]: Error: " + e.getMessage());
+                continue;
+            }
 
             turnDone.join();
         }

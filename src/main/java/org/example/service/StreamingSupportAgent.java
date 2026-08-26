@@ -2,6 +2,10 @@ package org.example.service;
 
 import dev.langchain4j.service.SystemMessage;
 import dev.langchain4j.service.TokenStream;
+import dev.langchain4j.service.guardrail.InputGuardrails;
+import dev.langchain4j.service.guardrail.OutputGuardrails;
+import org.example.guardrail.PromptInjectionInputGuardrail;
+import org.example.guardrail.SecretsRedactionOutputGuardrail;
 
 public interface StreamingSupportAgent {
 
@@ -13,6 +17,8 @@ public interface StreamingSupportAgent {
             "I'm sorry, I can only help with questions about your banking account, "
                     + "payments, and transactions. Could you ask me something related to that?";
 
+    @InputGuardrails(PromptInjectionInputGuardrail.class)
+    @OutputGuardrails(SecretsRedactionOutputGuardrail.class)
     @SystemMessage({
             "You are a helpful and polite Banking Support Assistant.",
             "Keep you answers long and detailed.",
